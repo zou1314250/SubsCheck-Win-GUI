@@ -51,6 +51,7 @@ namespace subs_check.win.gui
 
         // ===== 自动去失效网站 =====
         private System.Windows.Forms.CheckBox checkBox7;      // 自动去失效网站开关
+        private System.Windows.Forms.NumericUpDown numericUpDown9; // 订阅获取重试次数
         private List<string> roundLogLines = new List<string>(); // 本轮内核日志（仅保留判定所需）
         private bool roundActive = false;                     // 本轮是否正在采集
         private bool sweepRunning = false;                    // 防止重复处理同一轮
@@ -135,9 +136,36 @@ namespace subs_check.win.gui
             groupBox1.Controls.Add(checkBox7);
             checkBox7.BringToFront();
 
+            // 订阅获取重试次数：默认 1（失败直接跳过）
+            var retryLabel = new System.Windows.Forms.Label();
+            retryLabel.AutoSize = true;
+            retryLabel.Location = new System.Drawing.Point(9, 498);
+            retryLabel.Name = "retryLabel";
+            retryLabel.Size = new System.Drawing.Size(95, 12);
+            retryLabel.Text = "订阅获取重试:";
+
+            numericUpDown9 = new System.Windows.Forms.NumericUpDown();
+            numericUpDown9.Location = new System.Drawing.Point(105, 495);
+            numericUpDown9.Name = "numericUpDown9";
+            numericUpDown9.Size = new System.Drawing.Size(58, 21);
+            numericUpDown9.Minimum = 1;
+            numericUpDown9.Maximum = 10;
+            numericUpDown9.Value = 1;
+
+            toolTip1.SetToolTip(numericUpDown9,
+                "订阅获取重试次数：\n\n" +
+                "1 = 失败直接跳过，不重试（推荐）\n" +
+                "  订阅源失效时（404／格式错）重试没有意义，只会拖慢整轮测速。\n\n" +
+                "调大可在网络抖动严重时提高成功率，但会显著增加耗时。");
+
+            groupBox1.Controls.Add(retryLabel);
+            groupBox1.Controls.Add(numericUpDown9);
+            retryLabel.BringToFront();
+            numericUpDown9.BringToFront();
+
             // 需要给新控件留出空间
-            if (groupBox1.Size.Height < 500)
-                groupBox1.Size = new System.Drawing.Size(groupBox1.Size.Width, 500);
+            if (groupBox1.Size.Height < 522)
+                groupBox1.Size = new System.Drawing.Size(groupBox1.Size.Width, 522);
         }
 
         private void checkBox7_CheckedChanged(object sender, EventArgs e)
@@ -501,6 +529,19 @@ namespace subs_check.win.gui
                         // YAML 布尔值经 ToString() 后可能是 True/False，这里忽略大小写
                         checkBox7.Checked = autoRemoveCfg == null
                             || string.Equals(autoRemoveCfg, "true", StringComparison.OrdinalIgnoreCase);
+                    }
+
+                    // 订阅获取重试次数（缺省为 1：失败直接跳过）
+                    if (numericUpDown9 != null)
+                    {
+                        int? retryCfg = 读取config整数(config, "sub-urls-retry");
+                        if (retryCfg.HasValue)
+                        {
+                            int v = retryCfg.Value;
+                            if (v < numericUpDown9.Minimum) v = (int)numericUpDown9.Minimum;
+                            if (v > numericUpDown9.Maximum) v = (int)numericUpDown9.Maximum;
+                            numericUpDown9.Value = v;
+                        }
                     }
 
                     string mediacheck = 读取config字符串(config, "media-check");
@@ -1032,7 +1073,8 @@ namespace subs_check.win.gui
                 config["media-check"] = checkBox2.Checked;//是否开启流媒体检测
                 config["keep-success-proxies"] = false;
                 config["print-progress"] = false;//是否显示进度
-                config["sub-urls-retry"] = 3;//重试次数(获取订阅失败后重试次数)
+                // 订阅获取重试次数：1 = 失败直接跳过（不重试），避免在确定性失效上浪费大量时间
+                config["sub-urls-retry"] = numericUpDown9 != null ? (int)numericUpDown9.Value : 1;
                 config["subscheck-version"] = 当前subsCheck版本号;//当前subsCheck版本号
 
                 config["gui-auto"] = checkBox5.Checked;//是否开机自启
@@ -2677,6 +2719,164 @@ namespace subs_check.win.gui
             public string ProxyURL { get; set; }
             public long Latency { get; set; }
             public bool IsAvailable { get; set; }
+
+            /// <summary>是否为「假代理」：能返回 200，但内容不是订阅（例如返回自身网页）。</summary>
+            public bool IsFake { get; set; }
+
+            /// <summary>不可用时的简短原因，便于日志排查。</summary>
+            public string FailReason { get; set; }
+        }
+
+        /// <summary>GitHub 代理探测结果。</summary>
+        private class ProxyProbeResult
+        {
+            public bool Ok;
+            public bool IsFake;
+            public string Reason;
+        }
+
+        // 探针目标：一个体积小、内容稳定、能代表真实订阅抓取的 raw 文件。
+        // 用 go.mod 这类纯文本文件，内容确定且不易被代理站点改写。
+        private const string PROXY_PROBE_PATH = "raw.githubusercontent.com/beck-8/subs-check/master/go.mod";
+
+        /// <summary>
+        /// 探测一个 GitHub 代理是否真正可用。
+        ///
+        /// 关键点一：不能只看 HTTP 状态码。实测中有大量「假代理」——它们对任意路径都返回
+        /// 200 + 自己的网页（例如某 IP 查询站的 HTML），延迟天然很低，于是每次
+        /// 「自动选择」都会精准挑中它们，导致后续所有订阅解析失败（format invalid）。
+        /// 因此这里必须校验响应体内容确实是目标文件。
+        ///
+        /// 关键点二：必须显式启用 TLS 1.2。.NET Framework 4.x 的进程默认
+        /// SecurityProtocol 只有 Ssl3|Tls(1.0)，现代代理站点会直接拒绝握手，
+        /// 于是全部误判为「发送请求时出错」。
+        /// </summary>
+        private async Task<ProxyProbeResult> ProbeGitHubProxyAsync(string proxyItem, int timeoutSeconds = 8)
+        {
+            var outcome = new ProxyProbeResult { Ok = false, IsFake = false, Reason = "" };
+
+            if (string.IsNullOrWhiteSpace(proxyItem))
+            {
+                outcome.Reason = "空代理";
+                return outcome;
+            }
+
+            // 显式启用现代 TLS，否则部分代理站点握手失败
+            TryEnableModernTls();
+
+            int proxyType = GetProxyType(proxyItem);
+            string checkUrl = proxyType == 1
+                // 直接访问型：https://bgithub.xyz/owner/repo/...
+                ? $"https://{proxyItem}/{PROXY_PROBE_PATH.Substring("raw.githubusercontent.com/".Length)}"
+                // 代理加速型：https://ghp.ci/https://raw.githubusercontent.com/...
+                : $"https://{proxyItem}/{PROXY_PROBE_PATH}";
+
+            try
+            {
+                using (var handler = new HttpClientHandler
+                {
+                    // 代理站点常见自签证书/链不完整，这里放宽以正确识别可用性
+                    ServerCertificateCustomValidationCallback = (m, c, ch, e) => true,
+
+                    // 直连探测：避免本机残留的失效代理配置干扰判定
+                    UseProxy = false,
+                    Proxy = null
+                })
+                using (HttpClient client = new HttpClient(handler))
+                {
+                    client.Timeout = TimeSpan.FromSeconds(timeoutSeconds);
+                    client.DefaultRequestHeaders.UserAgent.ParseAdd(
+                        "clash.meta (https://github.com/beck-8/subs-check)");
+
+                    using (HttpResponseMessage response = await client.GetAsync(checkUrl))
+                    {
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            outcome.Reason = $"HTTP {(int)response.StatusCode}";
+                            return outcome;
+                        }
+
+                        // 限制读取量：探针文件很小，读太多没意义
+                        string body;
+                        using (var stream = await response.Content.ReadAsStreamAsync())
+                        {
+                            var buffer = new byte[64 * 1024];
+                            int read = await stream.ReadAsync(buffer, 0, buffer.Length);
+                            body = read > 0 ? Encoding.UTF8.GetString(buffer, 0, read) : "";
+                        }
+
+                        var verdict = ClassifyProxyBody(body);
+                        outcome.Ok = verdict == ProxyBodyKind.ValidFile;
+                        outcome.IsFake = verdict == ProxyBodyKind.HtmlPage;
+                        outcome.Reason = outcome.Ok ? "" : (outcome.IsFake ? "返回网页而非文件（假代理）" : "内容不符合预期");
+                        return outcome;
+                    }
+                }
+            }
+            catch (TaskCanceledException)
+            {
+                outcome.Reason = "超时";
+            }
+            catch (Exception ex)
+            {
+                outcome.Reason = ex.Message.Length > 40 ? ex.Message.Substring(0, 40) : ex.Message;
+            }
+
+            return outcome;
+        }
+
+        private enum ProxyBodyKind { ValidFile, HtmlPage, Unknown }
+
+        /// <summary>
+        /// 显式启用现代 TLS。
+        ///
+        /// .NET Framework 4.x 进程默认 SecurityProtocol 只有 Ssl3|Tls(1.0)，
+        /// 现代站点（含多数 GitHub 代理）会直接拒绝握手，表现为
+        /// 「发送请求时出错 → 未能创建 SSL/TLS 安全通道」。
+        /// </summary>
+        internal static void TryEnableModernTls()
+        {
+            try
+            {
+                System.Net.ServicePointManager.SecurityProtocol |= System.Net.SecurityProtocolType.Tls12;
+
+                // TLS 1.3 在部分老系统上不存在，取不到就忽略
+                try
+                {
+                    System.Net.ServicePointManager.SecurityProtocol |= (System.Net.SecurityProtocolType)12288;
+                }
+                catch { }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 判断代理返回体是否像「真实的 raw 文件」。
+        /// 真代理应返回 go.mod 的纯文本内容；假代理通常返回 HTML 页面。
+        /// </summary>
+        private static ProxyBodyKind ClassifyProxyBody(string body)
+        {
+            if (string.IsNullOrWhiteSpace(body)) return ProxyBodyKind.Unknown;
+
+            string head = body.TrimStart();
+
+            // HTML 页面特征（假代理最典型的形态）
+            if (head.StartsWith("<!doctype", StringComparison.OrdinalIgnoreCase) ||
+                head.StartsWith("<html", StringComparison.OrdinalIgnoreCase) ||
+                head.StartsWith("<?xml", StringComparison.OrdinalIgnoreCase))
+                return ProxyBodyKind.HtmlPage;
+
+            // go.mod 的确定特征
+            if (body.IndexOf("module ", StringComparison.Ordinal) >= 0 &&
+                body.IndexOf("go ", StringComparison.Ordinal) >= 0)
+                return ProxyBodyKind.ValidFile;
+
+            // 兜底：明显的 HTML 标签也算网页
+            if (head.Length > 0 && head[0] == '<' &&
+                body.IndexOf("<body", StringComparison.OrdinalIgnoreCase) >= 0)
+                return ProxyBodyKind.HtmlPage;
+
+            return ProxyBodyKind.Unknown;
         }
 
         private async Task<string> DetectFastestGitHubProxyAsync(List<string> proxyItems)
@@ -2700,7 +2900,8 @@ namespace subs_check.win.gui
             logMessages.AppendLine("代理检测结果:");
             int availableCount = 0;
             int failedCount = 0;
-            
+            int fakeCount = 0;
+
             foreach (var proxy in results)
             {
                 if (proxy.IsAvailable)
@@ -2711,10 +2912,13 @@ namespace subs_check.win.gui
                 else
                 {
                     failedCount++;
+                    if (proxy.IsFake) fakeCount++;
+                    logMessages.AppendLine($"  ✗ {proxy.ProxyName}: {proxy.FailReason}");
                 }
             }
-            
-            logMessages.AppendLine($"检测完成：共检测 {results.Length} 个代理，可用 {availableCount} 个，失败 {failedCount} 个");
+
+            logMessages.AppendLine($"检测完成：共检测 {results.Length} 个代理，可用 {availableCount} 个，失败 {failedCount} 个" +
+                                   (fakeCount > 0 ? $"（其中假代理 {fakeCount} 个，已排除）" : ""));
             
             // 一次性输出所有日志
             Log(logMessages.ToString());
@@ -2894,34 +3098,15 @@ namespace subs_check.win.gui
             {
                 var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 
-                string checkUrl;
-                int proxyType = GetProxyType(proxyItem);
+                var probe = await ProbeGitHubProxyAsync(proxyItem);
+                stopwatch.Stop();
 
-                if (proxyType == 1)
-                {
-                    // 直接访问型：https://bgithub.xyz/cmliu/SubsCheck-Win-GUI/master/packages.config
-                    checkUrl = $"https://{proxyItem}/cmliu/SubsCheck-Win-GUI/master/packages.config";
-                }
-                else
-                {
-                    // 代理加速型：https://ghp.ci/https://raw.githubusercontent.com/cmliu/SubsCheck-Win-GUI/master/packages.config
-                    checkUrl = $"https://{proxyItem}/https://raw.githubusercontent.com/cmliu/SubsCheck-Win-GUI/master/packages.config";
-                }
+                result.IsAvailable = probe.Ok;
+                result.IsFake = probe.IsFake;
+                result.FailReason = probe.Reason;
 
-                using (HttpClient client = new HttpClient())
-                {
-                    client.Timeout = TimeSpan.FromSeconds(5);
-                    client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win32; x86) AppleWebKit/537.36 (KHTML, like Gecko) cmliu/SubsCheck-Win-GUI");
-
-                    HttpResponseMessage response = await client.GetAsync(checkUrl);
-                    stopwatch.Stop();
-
-                    if (response.IsSuccessStatusCode)
-                    {
-                        result.IsAvailable = true;
-                        result.Latency = stopwatch.ElapsedMilliseconds;
-                    }
-                }
+                if (probe.Ok)
+                    result.Latency = stopwatch.ElapsedMilliseconds;
             }
             catch
             {
@@ -4513,36 +4698,18 @@ namespace subs_check.win.gui
         {
             try
             {
-                var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+                var probe = await ProbeGitHubProxyAsync(proxyItem);
 
-                string checkUrl;
-                int proxyType = GetProxyType(proxyItem);
-
-                if (proxyType == 1)
+                if (probe.Ok)
                 {
-                    // 直接访问型
-                    checkUrl = $"https://{proxyItem}/cmliu/SubsCheck-Win-GUI/master/packages.config";
-                }
-                else
-                {
-                    // 代理加速型
-                    checkUrl = $"https://{proxyItem}/https://raw.githubusercontent.com/cmliu/SubsCheck-Win-GUI/master/packages.config";
+                    Log($"✓ GitHub代理可用: {proxyItem}");
+                    return true;
                 }
 
-                using (HttpClient client = new HttpClient())
-                {
-                    client.Timeout = TimeSpan.FromSeconds(5);
-                    client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win32; x86) AppleWebKit/537.36 (KHTML, like Gecko) cmliu/SubsCheck-Win-GUI");
+                if (probe.IsFake)
+                    Log($"✗ GitHub代理为假代理（返回网页而非文件）: {proxyItem}", true);
 
-                    HttpResponseMessage response = await client.GetAsync(checkUrl);
-                    stopwatch.Stop();
-
-                    if (response.IsSuccessStatusCode)
-                    {
-                        Log($"✓ GitHub代理可用: {proxyItem} ({stopwatch.ElapsedMilliseconds}ms)");
-                        return true;
-                    }
-                }
+                return false;
             }
             catch
             {

@@ -131,8 +131,14 @@ namespace subs_check.win.gui
 
         /// <summary>
         /// 把内核日志里的地址对应回用户订阅列表中的原始地址。
-        /// 内核会用 utils.WarpUrl 规范化地址，GUI 也可能把 GitHub raw 链接改写成代理链接，
-        /// 因此这里做多级容错匹配。
+        ///
+        /// 关键点：内核 utils.WarpUrl 会做 `githubProxy + url`，而日志里的 URL 也不一定是
+        /// 订阅框里的原文。实测（真实日志 + 真实 config）存在这些形态：
+        ///   订阅框原始   : https://raw.githubusercontent.com/O/R/main/x.txt
+        ///   内核日志(包装): https://gh.tryxd.cn/raw.githubusercontent.com/O/R/main/x.txt
+        ///   镜像变体     : https://cdn.jsdelivr.net/gh/O/R@main/x.txt
+        /// 注意包装后**没有第二个 https://**，所以不能只靠简单子串包含来匹配。
+        /// 这里改用「归一化主体路径」比较：剥掉协议、代理前缀、镜像域名差异，只比 O/R/path。
         /// </summary>
         public static string MatchToOriginal(string loggedUrl, IList<string> urls)
         {
@@ -146,18 +152,25 @@ namespace subs_check.win.gui
                 if (string.Equals(u, loggedUrl, StringComparison.OrdinalIgnoreCase))
                     return u;
 
-            // 2) 忽略大小写与首尾斜杠
+            // 2) 归一化后相等
+            string keyLogged = NormalizeToRepoPath(loggedUrl);
+            if (keyLogged != null)
+            {
+                foreach (var u in urls)
+                {
+                    if (string.Equals(NormalizeToRepoPath(u), keyLogged, StringComparison.OrdinalIgnoreCase))
+                        return u;
+                }
+            }
+
+            // 3) 一方包含另一方（忽略大小写与尾部斜杠）
             string normLogged = NormalizeForCompare(loggedUrl);
             foreach (var u in urls)
-                if (string.Equals(NormalizeForCompare(u), normLogged, StringComparison.OrdinalIgnoreCase))
-                    return u;
-
-            // 3) 包一层 GitHub 代理的情形：日志里是原始 raw 链接，订阅框里是代理前缀 + 原链接
-            foreach (var u in urls)
             {
-                if (u.IndexOf(loggedUrl, StringComparison.OrdinalIgnoreCase) >= 0)
-                    return u;
-                if (loggedUrl.IndexOf(u, StringComparison.OrdinalIgnoreCase) >= 0)
+                string nu = NormalizeForCompare(u);
+                if (nu.Length == 0 || normLogged.Length == 0) continue;
+                if (nu.IndexOf(normLogged, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    normLogged.IndexOf(nu, StringComparison.OrdinalIgnoreCase) >= 0)
                     return u;
             }
 
@@ -168,10 +181,91 @@ namespace subs_check.win.gui
                 string us = u.Replace("/om/", "/");
                 if (string.Equals(NormalizeForCompare(us), NormalizeForCompare(stripped), StringComparison.OrdinalIgnoreCase))
                     return u;
-                if (us.IndexOf(stripped, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    stripped.IndexOf(us, StringComparison.OrdinalIgnoreCase) >= 0)
+                string kUs = NormalizeToRepoPath(us);
+                if (kUs != null && string.Equals(kUs, NormalizeToRepoPath(stripped), StringComparison.OrdinalIgnoreCase))
                     return u;
             }
+
+            return null;
+        }
+
+        /// <summary>
+        /// 抽取「仓库路径」用于跨代理/镜像比对：把各种写法统一成 "owner/repo/路径"。
+        /// 处理 raw.githubusercontent.com、cdn.jsdelivr.net/gh、以及任意 GitHub 代理前缀。
+        /// 无法识别时返回 null。
+        /// </summary>
+        private static string NormalizeToRepoPath(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return null;
+            string s = url.Trim();
+
+            // 去掉协议
+            int scheme = s.IndexOf("://", StringComparison.Ordinal);
+            if (scheme >= 0) s = s.Substring(scheme + 3);
+
+            // 去掉查询与锚点
+            int cut = s.IndexOfAny(new[] { '?', '#' });
+            if (cut >= 0) s = s.Substring(0, cut);
+
+            // raw.githubusercontent.com/<owner>/<repo>/<ref>/<path>  -> owner/repo/path
+            const string rawHost = "raw.githubusercontent.com/";
+            int rawIdx = s.IndexOf(rawHost, StringComparison.OrdinalIgnoreCase);
+            if (rawIdx >= 0)
+            {
+                string rest = s.Substring(rawIdx + rawHost.Length);
+                var parts = rest.Split('/');
+                if (parts.Length >= 4)
+                {
+                    // 剔除 ref 段，使 raw 写法与 jsDelivr(@ref) 写法归一化到同一形态：
+                    //   owner/repo/refs/heads/main/path   -> owner/repo/path
+                    //   owner/repo/refs/tags/v1/path      -> owner/repo/path
+                    //   owner/repo/main/path              -> owner/repo/path
+                    int pathStart;
+                    if (parts.Length >= 6 && parts[2] == "refs" &&
+                        (parts[3] == "heads" || parts[3] == "tags"))
+                        pathStart = 5;          // refs/heads/<branch>/path
+                    else if (parts.Length >= 5 && parts[2] == "refs")
+                        pathStart = 4;          // refs/<ref>/path
+                    else
+                        pathStart = 3;          // <branch>/path
+
+                    if (pathStart < parts.Length)
+                        return parts[0] + "/" + parts[1] + "/" + string.Join("/", parts, pathStart, parts.Length - pathStart);
+                }
+                return rest;
+            }
+
+            // cdn.jsdelivr.net/gh/<owner>/<repo>@<ref>/<path>  -> owner/repo/path
+            const string jsdHost = "cdn.jsdelivr.net/gh/";
+            int jsdIdx = s.IndexOf(jsdHost, StringComparison.OrdinalIgnoreCase);
+            if (jsdIdx >= 0)
+            {
+                string rest = s.Substring(jsdIdx + jsdHost.Length);
+                int at = rest.IndexOf('@');
+                if (at >= 0)
+                {
+                    string repoPart = rest.Substring(0, at);          // owner/repo
+                    int slash = rest.IndexOf('/', at);
+                    string pathPart = slash >= 0 ? rest.Substring(slash + 1) : "";
+                    return repoPart + "/" + pathPart;
+                }
+                return rest;
+            }
+
+            // github.com/<owner>/<repo>/blob|raw/<ref>/<path> -> owner/repo/path
+            const string ghHost = "github.com/";
+            int ghIdx = s.IndexOf(ghHost, StringComparison.OrdinalIgnoreCase);
+            if (ghIdx >= 0)
+            {
+                string rest = s.Substring(ghIdx + ghHost.Length);
+                var parts = rest.Split('/');
+                if (parts.Length >= 5 && (parts[2] == "blob" || parts[2] == "raw" || parts[2] == "tree"))
+                    return parts[0] + "/" + parts[1] + "/" + string.Join("/", parts, 4, parts.Length - 4);
+            }
+
+            // 其它（含代理前缀但路径里带 raw.githubusercontent.com 的情形）
+            int anyRaw = s.IndexOf(rawHost, StringComparison.OrdinalIgnoreCase);
+            if (anyRaw >= 0) return NormalizeToRepoPath("https://" + s.Substring(anyRaw));
 
             return null;
         }

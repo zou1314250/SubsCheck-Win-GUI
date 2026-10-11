@@ -107,6 +107,7 @@ namespace subs_check.win.gui
         /// 确定性（立即剔除）：
         ///   返回状态码: 404 / 410 / 401 / 403 / 400   —— 服务端明确答复
         ///   订阅链接没有proxies / 解析proxy错误      —— 拉到了但内容不可解析
+        ///   format invalid / 无法解析                 —— 内容格式错误，重试不会变好
         ///
         /// 网络类（需连续 2 轮才剔除，避免误杀）：
         ///   context deadline exceeded / timeout
@@ -126,6 +127,12 @@ namespace subs_check.win.gui
             if (string.IsNullOrWhiteSpace(err)) return false;
 
             string e = err.ToLowerInvariant();
+
+            // 内容格式错误：拉取成功但解析不出节点，重试多少次都一样
+            // 实测最常见（代理被套错时会命中全部订阅）：convert v2ray subscribe error: format invalid
+            if (e.IndexOf("format invalid", StringComparison.Ordinal) >= 0) return true;
+            if (e.IndexOf("无法解析", StringComparison.Ordinal) >= 0) return true;
+            if (e.IndexOf("invalid format", StringComparison.Ordinal) >= 0) return true;
 
             // 明确的 HTTP 状态码
             // 404/410 是「没了」；401/403/400 说明服务端拒绝该请求，同样重试无意义
