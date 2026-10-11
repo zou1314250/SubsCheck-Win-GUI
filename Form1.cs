@@ -1,4 +1,4 @@
-﻿using Newtonsoft.Json.Linq;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.Data;
@@ -48,6 +48,16 @@ namespace subs_check.win.gui
         int downloading = 0;
         int subscriptionFailureCount = 0; // 订阅链接失败计数器
         bool hasSwitchedToLocalProxy = false; // 是否已经切换到本地代理模式
+
+        // ===== 自动去失效网站 =====
+        private System.Windows.Forms.CheckBox checkBox7;      // 自动去失效网站开关
+        private List<string> roundLogLines = new List<string>(); // 本轮内核日志（仅保留判定所需）
+        private bool roundActive = false;                     // 本轮是否正在采集
+        private bool sweepRunning = false;                    // 防止重复处理同一轮
+        private SubscriptionHealthStore healthStore;          // 订阅源健康状态
+        private DeadSourceSweeper deadSourceSweeper;          // 去失效处理器
+        private const int MaxBufferedLogLines = 20000;        // 日志缓冲上限，防止长跑占用内存
+
         public Form1()
         {
             InitializeComponent();
@@ -55,6 +65,19 @@ namespace subs_check.win.gui
 
             // 初始化GitHub代理管理器
             proxyManager = new GitHubProxyManager(this);
+
+            // 初始化自动去失效模块（读取失败不影响主流程）
+            try
+            {
+                healthStore = SubscriptionHealthStore.Load();
+                deadSourceSweeper = new DeadSourceSweeper(healthStore);
+            }
+            catch
+            {
+                healthStore = new SubscriptionHealthStore();
+                deadSourceSweeper = new DeadSourceSweeper(healthStore);
+            }
+            SetupDeadSourceCheckBox();
 
             toolTip1.SetToolTip(numericUpDown1, "并发线程数：推荐 宽带峰值/50M。");
             toolTip1.SetToolTip(numericUpDown2, "检查间隔时间(分钟)：放置后台的时候，下次自动测速的间隔时间。\n\n 双击切换 使用「cron表达式」");
@@ -85,8 +108,42 @@ namespace subs_check.win.gui
             toolTip1.SetToolTip(textBox11, "支持标准cron表达式，如：\n 0 */2 * * * 表示每2小时的整点执行\n 0 0 */2 * * 表示每2天的0点执行\n 0 0 1 * * 表示每月1日0点执行\n */30 * * * * 表示每30分钟执行一次\n\n 双击切换 使用「分钟倒计时」");
 
             toolTip1.SetToolTip(checkBox5, "开机启动：勾选后，程序将在Windows启动时自动运行");
+
+            // 自动去失效网站
+            toolTip1.SetToolTip(checkBox7, "自动去失效网站：每轮测速结束后，自动检查哪些订阅源已失效并剔除。\n\n判定规则：\n· 确定性失效（404／无节点内容）立即剔除\n· 网络抖动类需连续 2 轮失败才剔除\n\n剔除的地址会备份，可在「订阅地址」窗口一键恢复。");
+
             // 设置通知图标的上下文菜单
             SetupNotifyIconContextMenu();
+        }
+
+        /// <summary>
+        /// 动态创建「自动去失效网站」复选框，挂在参数设置区启动按钮下方。
+        /// </summary>
+        private void SetupDeadSourceCheckBox()
+        {
+            checkBox7 = new System.Windows.Forms.CheckBox();
+            checkBox7.AutoSize = true;
+            checkBox7.Location = new System.Drawing.Point(9, 476);
+            checkBox7.Name = "checkBox7";
+            checkBox7.Size = new System.Drawing.Size(150, 16);
+            checkBox7.TabIndex = 40;
+            checkBox7.Text = "自动去失效网站";
+            checkBox7.Checked = true;
+            checkBox7.UseVisualStyleBackColor = true;
+            checkBox7.CheckedChanged += checkBox7_CheckedChanged;
+
+            groupBox1.Controls.Add(checkBox7);
+            checkBox7.BringToFront();
+
+            // 需要给新控件留出空间
+            if (groupBox1.Size.Height < 500)
+                groupBox1.Size = new System.Drawing.Size(groupBox1.Size.Width, 500);
+        }
+
+        private void checkBox7_CheckedChanged(object sender, EventArgs e)
+        {
+            if (checkBox7.Checked) Log("已开启「自动去失效网站」：每轮测速结束后自动剔除失效订阅源");
+            else Log("已关闭「自动去失效网站」");
         }
 
         private void SetupNotifyIconContextMenu()
@@ -339,7 +396,8 @@ namespace subs_check.win.gui
                     const string githubRawPrefix = "https://raw.githubusercontent.com/";
 
                     string mihomoOverwriteUrl = 读取config字符串(config, "mihomo-overwrite-url");
-                    int mihomoOverwriteUrlIndex = mihomoOverwriteUrl.IndexOf(githubRawPrefix);
+                    // 注意：必须先判空再取下标，否则配置里缺少该项时会抛空引用
+                    int mihomoOverwriteUrlIndex = mihomoOverwriteUrl == null ? -1 : mihomoOverwriteUrl.IndexOf(githubRawPrefix);
                     if (mihomoOverwriteUrl != null)
                     {
                         if (mihomoOverwriteUrl.Contains("http://127.0.0"))
@@ -435,6 +493,15 @@ namespace subs_check.win.gui
                     string renamenode = 读取config字符串(config, "rename-node");
                     if (renamenode != null && renamenode == "true") checkBox1.Checked = true;
                     else checkBox1.Checked = false;
+
+                    // 自动去失效网站开关（缺省为开启）
+                    if (checkBox7 != null)
+                    {
+                        string autoRemoveCfg = 读取config字符串(config, "auto-remove-dead-sources");
+                        // YAML 布尔值经 ToString() 后可能是 True/False，这里忽略大小写
+                        checkBox7.Checked = autoRemoveCfg == null
+                            || string.Equals(autoRemoveCfg, "true", StringComparison.OrdinalIgnoreCase);
+                    }
 
                     string mediacheck = 读取config字符串(config, "media-check");
                     if (mediacheck != null && mediacheck == "true") checkBox2.Checked = true;
@@ -735,7 +802,10 @@ namespace subs_check.win.gui
                 }
 
                 config["githubproxy"] = comboBox3.Text;
-                config["github-proxy"] = githubProxyURL;
+                // 内核 utils.WarpUrl 会把该值直接拼在每个 raw.githubusercontent.com 链接前面，
+                // 因此代理不可用时必须写成空串；若写成 "https:///" 之类的残缺前缀，
+                // 会生成 "https:///https://raw..." 导致 no Host in request URL。
+                config["github-proxy"] = NormalizeGitHubProxyPrefix(githubProxyURL);
 
                 // 智能代理模式判断 - useLocalProxyMode已在第616行定义
                 // 如果未勾选本地代理，但GitHub代理不可用，自动切换到本地代理模式
@@ -967,6 +1037,7 @@ namespace subs_check.win.gui
 
                 config["gui-auto"] = checkBox5.Checked;//是否开机自启
                 config["use-local-proxy"] = checkBox6.Checked;//是否使用本地代理
+                config["auto-remove-dead-sources"] = checkBox7 != null && checkBox7.Checked;//自动去失效网站
 
                 //保存几个成功的节点，为0代表不限制 
                 if (checkBox3.Checked) config["success-limit"] = (int)numericUpDown8.Value;
@@ -1739,6 +1810,9 @@ namespace subs_check.win.gui
                 // 启动进程
                 subsCheckProcess.Start();
 
+                // 开始新一轮去失效采集
+                BeginDeadSourceRound();
+
                 // 开始异步读取输出
                 subsCheckProcess.BeginOutputReadLine();
                 subsCheckProcess.BeginErrorReadLine();
@@ -1757,6 +1831,160 @@ namespace subs_check.win.gui
             }
         }
 
+
+        // ===== 自动去失效网站：一轮采集与处理 =====
+
+        /// <summary>开始新一轮日志采集。</summary>
+        private void BeginDeadSourceRound()
+        {
+            roundLogLines.Clear();
+            roundActive = true;
+            sweepRunning = false;
+        }
+
+        /// <summary>
+        /// 采集内核日志行。只保留判定需要的失败行，避免长时间运行占用内存。
+        /// </summary>
+        private void CollectDeadSourceLog(string rawLine)
+        {
+            if (!roundActive || string.IsNullOrEmpty(rawLine)) return;
+
+            // 进度行量大且与订阅判定无关，直接跳过
+            if (rawLine.IndexOf("进度: [", StringComparison.Ordinal) >= 0) return;
+
+            string clean = RemoveAnsiEscapeCodes(rawLine);
+
+            // 一轮测速结束的标志：内核在保存结果前输出「检测完成」
+            if (clean.IndexOf("检测完成", StringComparison.Ordinal) >= 0)
+            {
+                BeginInvoke(new Action(() => FinishDeadSourceRound("本轮检测完成")));
+                return;
+            }
+
+            if (!SubscriptionFailureParser.IsFailureLine(clean) &&
+                clean.IndexOf("订阅链接数量", StringComparison.Ordinal) < 0)
+                return;
+
+            if (roundLogLines.Count >= MaxBufferedLogLines) return;
+            roundLogLines.Add(clean);
+        }
+
+        /// <summary>
+        /// 本轮测速结束后执行去失效处理：剔除失效订阅源，并写回订阅框与配置。
+        /// </summary>
+        private void FinishDeadSourceRound(string trigger)
+        {
+            if (!roundActive || sweepRunning) return;
+            sweepRunning = true;
+            roundActive = false;
+
+            // 未勾选开关时只更新健康状态，不动订阅列表
+            bool autoRemove = checkBox7 != null && checkBox7.Checked;
+
+            try
+            {
+                var currentUrls = GetCurrentSubUrls();
+                if (currentUrls.Count == 0)
+                {
+                    roundLogLines.Clear();
+                    return;
+                }
+
+                var lines = new List<string>(roundLogLines);
+                roundLogLines.Clear();
+
+                var result = deadSourceSweeper.Sweep(currentUrls, lines, DateTime.Now, autoRemove);
+
+                if (result.Recovered.Count > 0)
+                    Log($"✓ 订阅源恢复正常 {result.Recovered.Count} 个：{string.Join("、", result.Recovered.Select(ShortenUrl))}");
+
+                foreach (var p in result.Pending)
+                    Log($"⚠️ 订阅源异常（暂不剔除）：{ShortenUrl(p.Url)} —— {p.Note}");
+
+                if (!autoRemove)
+                {
+                    return;
+                }
+
+                if (result.Removed.Count == 0)
+                    return;
+
+                // 从订阅框移除并写回配置
+                var removedUrls = new HashSet<string>(result.Removed.Select(r => r.Url), StringComparer.OrdinalIgnoreCase);
+                var kept = currentUrls.Where(u => !removedUrls.Contains(u)).ToList();
+                SetCurrentSubUrls(kept);
+
+                Log($"🧹 自动去失效网站：已剔除 {result.Removed.Count} 个失效订阅源（{trigger}）");
+                foreach (var r in result.Removed)
+                    Log($"   ✗ {ShortenUrl(r.Url)} —— {r.Reason}");
+                Log($"   ℹ️ 已备份到失效列表，可在「订阅地址」窗口一键恢复。剩余订阅源 {kept.Count} 个。");
+            }
+            catch (Exception ex)
+            {
+                Log($"自动去失效处理出错: {ex.Message}", true);
+            }
+            finally
+            {
+                sweepRunning = false;
+            }
+        }
+
+        /// <summary>读取订阅框中当前的地址列表。</summary>
+        private List<string> GetCurrentSubUrls()
+        {
+            var list = new List<string>();
+            if (textBox1 == null || string.IsNullOrEmpty(textBox1.Text)) return list;
+
+            foreach (var line in textBox1.Text.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string t = line.Trim();
+                // 跳过本地回环结果地址，它不是真正的订阅源
+                if (t.Length == 0 || t.StartsWith("http://127.0.0.1:")) continue;
+                list.Add(t);
+            }
+            return list;
+        }
+
+        /// <summary>把地址列表写回订阅框（保留本地回环结果地址）。</summary>
+        private void SetCurrentSubUrls(List<string> urls)
+        {
+            var final = new List<string>();
+
+            // 保留原有的本地回环地址
+            if (textBox1 != null && !string.IsNullOrEmpty(textBox1.Text))
+            {
+                foreach (var line in textBox1.Text.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string t = line.Trim();
+                    if (t.StartsWith("http://127.0.0.1:")) final.Add(t);
+                }
+            }
+
+            if (urls != null) final.AddRange(urls);
+
+            if (textBox1 != null)
+                textBox1.Text = string.Join(Environment.NewLine, final);
+        }
+
+        /// <summary>日志中显示的长地址做截断，避免刷屏。</summary>
+        private static string ShortenUrl(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return "";
+            if (url.Length <= 70) return url;
+
+            // 优先保留域名 + 尾部，便于识别
+            try
+            {
+                var uri = new Uri(url);
+                string tail = uri.AbsolutePath;
+                if (tail.Length > 30) tail = "..." + tail.Substring(tail.Length - 30);
+                return uri.Host + tail;
+            }
+            catch
+            {
+                return url.Substring(0, 35) + "..." + url.Substring(url.Length - 25);
+            }
+        }
 
         private void StopSubsCheckProcess()
         {
@@ -1797,6 +2025,9 @@ namespace subs_check.win.gui
         {
             if (!string.IsNullOrEmpty(e.Data))
             {
+                // 采集本轮日志，供「自动去失效网站」判定使用
+                CollectDeadSourceLog(e.Data);
+
                 // 检测订阅链接失败
                 if (e.Data.Contains("获取订阅链接错误跳过") && !hasSwitchedToLocalProxy)
                 {
@@ -1986,6 +2217,10 @@ namespace subs_check.win.gui
             BeginInvoke(new Action(() =>
             {
                 Log("subs-check.exe 已退出");
+
+                // 进程退出时兜底处理：覆盖本轮被中止、未打印「检测完成」的情况
+                if (roundActive) FinishDeadSourceRound("内核退出");
+
                 button1.Text = "▶️ 启动";
 
                 // 更新菜单项的启用状态
@@ -2208,6 +2443,31 @@ namespace subs_check.win.gui
 
             // 更新 comboBox3 的文本
             comboBox3.Text = input;
+        }
+
+        /// <summary>
+        /// 规范化写进 config 的 github-proxy 前缀。
+        /// 内核会把它直接拼在 raw.githubusercontent.com 链接之前，因此：
+        ///   - 值为空、只有协议头、或明显不是可用代理前缀时，返回空串（内核不拼接，走原生链接）
+        ///   - 正常前缀统一保证以 "/" 结尾
+        /// </summary>
+        private static string NormalizeGitHubProxyPrefix(string proxyUrl)
+        {
+            if (string.IsNullOrWhiteSpace(proxyUrl)) return "";
+
+            string s = proxyUrl.Trim();
+
+            // 只允许 http(s) 前缀且必须带主机名，避免 "https:///" 这类残缺值
+            if (!s.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !s.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                return "";
+
+            string rest = s.Substring(s.IndexOf("//", StringComparison.Ordinal) + 2);
+            string host = rest.Split('/', '?', '#')[0];
+            if (host.Length == 0 || host == ":" || host.Trim('/').Length == 0)
+                return "";
+
+            return s.EndsWith("/") ? s : s + "/";
         }
 
         private void 判断保存类型()

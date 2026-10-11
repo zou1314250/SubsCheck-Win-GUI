@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
@@ -43,6 +43,75 @@ namespace subs_check.win.gui
 
             // 设置button4的锚点为右、下
             button4.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
+
+            SetupDeadSourceButton();
+        }
+
+        /// <summary>
+        /// 动态创建「失效源」按钮：查看并一键恢复被自动剔除的订阅地址。
+        /// </summary>
+        private void SetupDeadSourceButton()
+        {
+            deadSourceButton = new System.Windows.Forms.Button();
+            deadSourceButton.Location = new System.Drawing.Point(430, 415);
+            deadSourceButton.Name = "deadSourceButton";
+            deadSourceButton.Size = new System.Drawing.Size(95, 23);
+            deadSourceButton.TabIndex = 23;
+            deadSourceButton.Text = "失效源…";
+            deadSourceButton.UseVisualStyleBackColor = true;
+            deadSourceButton.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
+            deadSourceButton.Click += deadSourceButton_Click;
+
+            this.Controls.Add(deadSourceButton);
+            deadSourceButton.BringToFront();
+        }
+
+        private System.Windows.Forms.Button deadSourceButton;
+
+        /// <summary>
+        /// 展示失效订阅源列表，支持勾选恢复。
+        /// </summary>
+        private void deadSourceButton_Click(object sender, EventArgs e)
+        {
+            var store = SubscriptionHealthStore.Load();
+            var removed = store.Removed;
+            if (removed == null || removed.Count == 0)
+            {
+                MessageBox.Show("当前没有失效订阅源记录。\r\n\r\n「自动去失效网站」会在测速结束后自动记录并剔除失效的订阅地址。",
+                    "失效源", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            using (var dlg = new DeadSourcesForm(store))
+            {
+                dlg.ShowDialog(this);
+
+                if (dlg.RestoredUrls.Count > 0)
+                {
+                    // 把恢复的地址追加回订阅框（避免与现有内容重复）
+                    var existing = new HashSet<string>(
+                        textBox1.Text.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.RemoveEmptyEntries)
+                            .Select(l => l.Trim()),
+                        StringComparer.OrdinalIgnoreCase);
+
+                    var sb = new StringBuilder(textBox1.Text);
+                    if (sb.Length > 0 && !sb.ToString().EndsWith("\n")) sb.Append(Environment.NewLine);
+
+                    int added = 0;
+                    foreach (var u in dlg.RestoredUrls)
+                    {
+                        if (existing.Contains(u)) continue;
+                        sb.Append(u).Append(Environment.NewLine);
+                        existing.Add(u);
+                        added++;
+                    }
+
+                    textBox1.Text = sb.ToString();
+
+                    MessageBox.Show($"已恢复 {added} 个订阅地址到列表。\r\n点击「保存」后生效。",
+                        "失效源", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
         }
 
         // 加载窗体时处理传入的内容

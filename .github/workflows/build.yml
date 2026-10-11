@@ -1,0 +1,150 @@
+name: Build
+
+on:
+  push:
+    branches: [ master, main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+env:
+  # 与 GUI 内置下载逻辑保持一致的内核版本与架构
+  SUBS_CHECK_VERSION: v1.6.5
+  SUBS_CHECK_ASSET: subs-check_Windows_i386.zip
+
+jobs:
+  build:
+    name: Build GUI (Release)
+    runs-on: windows-2022
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          Write-Host "--- MSBuild ---"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            & $vswhere -latest -products * -requires Microsoft.Component.MSBuild `
+                -find "MSBuild\**\Bin\MSBuild.exe"
+          }
+          Write-Host "--- .NET Framework targeting packs ---"
+          $ref = "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework"
+          if (Test-Path $ref) { Get-ChildItem $ref -Directory | Select-Object -Expand Name }
+          else { Write-Warning "Reference Assemblies 目录不存在" }
+          Write-Host "--- nuget ---"
+          nuget help | Select-Object -First 1
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: nuget restore subs-check.win.gui.sln -NonInteractive
+
+      - name: Build (Release)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild `
+                      -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+          if (-not $msbuild) { throw "未找到 MSBuild" }
+          Write-Host "使用 MSBuild: $msbuild"
+
+          # 注意：解决方案平台名是 "Any CPU"（带空格），写成 AnyCPU 会报 MSB4126
+          & $msbuild subs-check.win.gui.sln `
+              /p:Configuration=Release `
+              "/p:Platform=Any CPU" `
+              /v:minimal /nologo
+          if ($LASTEXITCODE -ne 0) { throw "构建失败，退出码 $LASTEXITCODE" }
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          $exe = "bin\Release\subs-check.win.gui.exe"
+          if (-not (Test-Path $exe)) { throw "未生成 $exe" }
+          $item = Get-Item $exe
+          Write-Host "✓ $exe  ($([math]::Round($item.Length/1KB,1)) KB)"
+          Get-ChildItem bin\Release -File | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Download subs-check kernel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver   = $env:SUBS_CHECK_VERSION
+          $asset = $env:SUBS_CHECK_ASSET
+          $base  = "https://github.com/beck-8/subs-check/releases/download/$ver"
+
+          New-Item -ItemType Directory -Force -Path bin\Release | Out-Null
+
+          Write-Host "下载 $asset ($ver) ..."
+          Invoke-WebRequest -Uri "$base/$asset" -OutFile kernel.zip -UseBasicParsing -TimeoutSec 900
+
+          # 校验官方 checksums，避免供应链问题
+          $verified = $false
+          try {
+            $sumFile = "subs-check_$($ver.TrimStart('v'))_checksums.txt"
+            Invoke-WebRequest -Uri "$base/$sumFile" -OutFile checksums.txt -UseBasicParsing -TimeoutSec 120
+
+            # 显式按文本读取，避免拿到字节数组
+            $lines = Get-Content checksums.txt
+            $row = $lines | Where-Object { $_ -match [regex]::Escape($asset) } | Select-Object -First 1
+            if ($row) {
+              $expected = ($row -split '\s+')[0].Trim().ToLower()
+              $actual   = (Get-FileHash kernel.zip -Algorithm SHA256).Hash.ToLower()
+              Write-Host "expected: $expected"
+              Write-Host "actual  : $actual"
+              if ($actual -ne $expected) { throw "SHA256 校验失败！下载文件与官方 checksums 不一致" }
+              Write-Host "✓ checksum 校验通过"
+              $verified = $true
+            } else {
+              Write-Warning "checksums 中未找到 $asset 条目"
+            }
+          } catch {
+            Write-Warning "checksum 校验未完成：$($_.Exception.Message)"
+          }
+          if (-not $verified) { Write-Warning "本次未通过 checksum 校验，请留意产物来源" }
+
+          Expand-Archive -Path kernel.zip -DestinationPath _kernel -Force
+          $kernel = Get-ChildItem _kernel -Recurse -Filter 'subs-check.exe' | Select-Object -First 1
+          if (-not $kernel) { throw "压缩包内未找到 subs-check.exe" }
+          Copy-Item $kernel.FullName bin\Release\subs-check.exe -Force
+          Remove-Item kernel.zip, _kernel -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "✓ subs-check.exe 就绪 ($([math]::Round((Get-Item 'bin\Release\subs-check.exe').Length/1MB,1)) MB)"
+
+      - name: Package release folder
+        shell: pwsh
+        run: |
+          $stage = "package\SubsCheck-Win-GUI"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          # GUI 本体与依赖
+          Copy-Item bin\Release\*.exe   $stage -Force
+          Copy-Item bin\Release\*.dll   $stage -Force
+          Copy-Item bin\Release\*.config -Force -ErrorAction SilentlyContinue -Destination $stage
+
+          # 说明文档
+          foreach ($doc in @('README.md', 'LICENSE', 'LICENSE.txt')) {
+            if (Test-Path $doc) { Copy-Item $doc $stage -Force }
+          }
+
+          # 预置空的 config/output 目录，避免首次运行时目录缺失
+          New-Item -ItemType Directory -Force -Path "$stage\config", "$stage\output" | Out-Null
+
+          Compress-Archive -Path $stage -DestinationPath SubsCheck-Win-GUI-win-i386.zip -Force
+          $zip = Get-Item SubsCheck-Win-GUI-win-i386.zip
+          Write-Host "✓ 打包完成: $($zip.Name) ($([math]::Round($zip.Length/1MB,2)) MB)"
+          Get-ChildItem $stage | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SubsCheck-Win-GUI-win-i386
+          path: SubsCheck-Win-GUI-win-i386.zip
+          if-no-files-found: error
+          retention-days: 30

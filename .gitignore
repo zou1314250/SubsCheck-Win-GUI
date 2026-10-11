@@ -382,3 +382,24 @@ config/
 
 # Sub-store 相关
 sub-store.log
+# ============================================================
+# CI / 构建产物（不应提交）
+# ============================================================
+package/
+SubsCheck-Win-GUI-*.zip
+checksums.txt
+kernel.zip
+
+# ============================================================
+# 本地凭据与抓取缓存（务必不要提交）
+# ============================================================
+.gh_token
+.gh_sub_cache/
+subscriptions.txt
+subscriptions.txt.rejected.txt
+
+# 本地测试脚本（保留在工作区，不入库）
+一键爬取订阅.bat
+gh_sub_crawler.py
+seeds.txt
+repos.txt

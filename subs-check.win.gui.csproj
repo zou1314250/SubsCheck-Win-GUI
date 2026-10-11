@@ -92,6 +92,10 @@
       <DependentUpon>MoreYAML.cs</DependentUpon>
     </Compile>
     <Compile Include="Program.cs" />
+    <Compile Include="SubscriptionHealth.cs" />
+    <Compile Include="SubscriptionFailure.cs" />
+    <Compile Include="DeadSourceSweeper.cs" />
+    <Compile Include="DeadSourcesForm.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <EmbeddedResource Include="about.resx">
       <DependentUpon>about.cs</DependentUpon>
